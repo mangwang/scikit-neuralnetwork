@@ -39,9 +39,12 @@ class MultiLayerPerceptronBackend(BaseBackend):
         self.mlp = None
         self.f = None
         self.trainer = None
-        self.cost = None
+        self.regularizer = None
 
     def _create_mlp_trainer(self, params):
+        self.data_output = T.matrix('y')
+        self.data_weights = T.matrix('s')
+
         # Aggregate all regularization parameters into common dictionaries.
         layer_decay = {}
         if self.regularize in ('L1', 'L2') or any(l.weight_decay for l in self.layers):
@@ -55,18 +58,24 @@ class MultiLayerPerceptronBackend(BaseBackend):
                 self.regularize = 'L2'
             penalty = getattr(lasagne.regularization, self.regularize.lower())
             regularize = lasagne.regularization.apply_penalty
-            self.cost = sum(layer_decay[s.name] * regularize(l.get_params(tags={'regularizable': True}), penalty)
+            self.regularizer = sum(layer_decay[s.name] * regularize(l.get_params(tags={'regularizable': True}), penalty)
                                 for s, l in zip(self.layers, self.mlp))
 
         cost_functions = {'mse': 'squared_error', 'mcc': 'categorical_crossentropy'}
         loss_type = self.loss_type or ('mcc' if self.is_classifier else 'mse')
         assert loss_type in cost_functions,\
                     "Loss type `%s` not supported by Lasagne backend." % loss_type
-        cost_fn = getattr(lasagne.objectives, cost_functions[loss_type])
-        cost_eval = cost_fn(self.symbol_output, self.tensor_output).mean()
-        if self.cost is not None:
-            cost_eval = cost_eval * self.cost
-        return self._create_trainer(params, cost_eval)
+
+        cost_obj = getattr(lasagne.objectives, cost_functions[loss_type])
+        cost_symbol = cost_obj(self.network_output, self.data_output)
+        if self.weighted:
+            cost_symbol = cost_symbol * self.data_weights
+
+        cost_symbol = cost_symbol.mean()
+        if self.regularizer is not None:
+            cost_symbol += self.regularizer
+
+        return self._create_trainer(params, cost_symbol)
 
     def _create_trainer(self, params, cost):
         if self.learning_rule in ('sgd', 'adagrad', 'adadelta', 'rmsprop', 'adam'):
@@ -80,8 +89,9 @@ class MultiLayerPerceptronBackend(BaseBackend):
             raise NotImplementedError(
                 "Learning rule type `%s` is not supported." % self.learning_rule)
 
-        return theano.function([self.tensor_input, self.tensor_output], cost,
+        return theano.function([self.data_input, self.data_output, self.data_weights], cost,
                                updates=self._learning_rule,
+                               on_unused_input='ignore',
                                allow_input_downcast=True)
 
     def _get_activation(self, l):        
@@ -130,13 +140,12 @@ class MultiLayerPerceptronBackend(BaseBackend):
                                          nonlinearity=self._get_activation(layer))
 
     def _create_mlp(self, X):
-        self.tensor_input = T.tensor4('X') if self.is_convolution else T.matrix('X')
-        self.tensor_output = T.matrix('y')
+        self.data_input = T.tensor4('X') if self.is_convolution else T.matrix('X')
         
         lasagne.random.get_rng().seed(self.random_state)
 
         shape = list(X.shape)
-        network = lasagne.layers.InputLayer([None]+shape[1:], self.tensor_input)
+        network = lasagne.layers.InputLayer([None]+shape[1:], self.data_input)
 
         # Create the layers one by one, connecting to previous.
         self.mlp = []
@@ -173,8 +182,8 @@ class MultiLayerPerceptronBackend(BaseBackend):
 
         log.debug("")
 
-        self.symbol_output = lasagne.layers.get_output(network, deterministic=True)
-        self.f = theano.function([self.tensor_input], self.symbol_output, allow_input_downcast=True)
+        self.network_output = lasagne.layers.get_output(network, deterministic=True)
+        self.f = theano.function([self.data_input], self.network_output, allow_input_downcast=True)
 
     def _initialize_impl(self, X, y=None):
         if self.is_convolution:
@@ -235,7 +244,8 @@ class MultiLayerPerceptronBackend(BaseBackend):
     def _train_impl(self, X, y):
         loss, batches = 0.0, 0
         for Xb, yb in self._iterate_data(X, y, self.batch_size, shuffle=True):
-            loss += self.trainer(Xb, yb)
+            wb = numpy.ones((1, yb.shape[0])) # Wrong size?
+            loss += self.trainer(Xb, yb, wb)
             batches += 1
         return loss / batches
 
@@ -243,6 +253,7 @@ class MultiLayerPerceptronBackend(BaseBackend):
         loss, batches = 0.0, 0
         for Xb, yb in self._iterate_data(X, y, self.batch_size, shuffle=True):
             ys = self.f(Xb)
+            # TODO: Loss must be the same as for the training...
             loss += ((ys - yb) ** 2.0).mean()
             batches += 1
         return loss / batches

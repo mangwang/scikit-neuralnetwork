@@ -434,6 +434,7 @@ class NeuralNetwork(object):
         self.f_stable = f_stable
         self.valid_set = valid_set
         self.valid_size = valid_size
+        self.weighted = True
         self.loss_type = loss_type
         self.mutator = mutator
         self.debug = debug
